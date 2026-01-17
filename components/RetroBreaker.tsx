@@ -1,14 +1,15 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { GameState, Particle, Brick, Ball, Paddle } from '../types';
+import { GameState, Particle, Brick, Ball, Paddle, PowerUp, Projectile } from '../types';
 import { soundManager } from '../utils/audio';
-import { Play, RotateCcw, Volume2, VolumeX, Trophy } from 'lucide-react';
+import { Play, RotateCcw, Volume2, VolumeX, Trophy, Gamepad2, Zap, Target } from 'lucide-react';
 
-const PADDLE_HEIGHT = 100;
-const PADDLE_WIDTH = 15;
+const PADDLE_WIDTH = 100;
+const PADDLE_HEIGHT = 20;
 const BALL_RADIUS = 8;
-const BALL_SPEED_BASE = 8;
+const BALL_SPEED_BASE = 6;
 const SLOW_MO_FACTOR = 0.3;
-const PARTICLES_PER_EXPLOSION = 20;
+const GRAVITY_BRICKS = 0.05;
+const COMBO_TIMEOUT = 2500; // ms
 
 const RetroBreaker: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -17,93 +18,226 @@ const RetroBreaker: React.FC = () => {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [winner, setWinner] = useState<string | null>(null);
+  const [gamepadsActive, setGamepadsActive] = useState(false);
 
   // Input State
   const keys = useRef<{ [key: string]: boolean }>({});
+  const lastFireTime = useRef<{p1: number, p2: number}>({p1: 0, p2: 0});
 
   // Game State
   const gameState = useRef<GameState>({
-    p1: { y: 0, height: PADDLE_HEIGHT, width: PADDLE_WIDTH, score: 0, color: '#06b6d4', side: 'left' }, // cyan-500
-    p2: { y: 0, height: PADDLE_HEIGHT, width: PADDLE_WIDTH, score: 0, color: '#d946ef', side: 'right' }, // fuchsia-500
-    ball: { pos: { x: 0, y: 0 }, vel: { x: 0, y: 0 }, radius: BALL_RADIUS, active: false, speed: BALL_SPEED_BASE },
+    p1: { 
+      x: 0, y: 0, width: PADDLE_WIDTH, height: PADDLE_HEIGHT, 
+      score: 0, color: '#06b6d4', baseColor: '#06b6d4', side: 'left',
+      ammo: 5, widthTimer: 0, superCharge: 0, sticky: false, stickyTimer: 0
+    },
+    p2: { 
+      x: 0, y: 0, width: PADDLE_WIDTH, height: PADDLE_HEIGHT, 
+      score: 0, color: '#d946ef', baseColor: '#d946ef', side: 'right',
+      ammo: 5, widthTimer: 0, superCharge: 0, sticky: false, stickyTimer: 0
+    },
+    balls: [],
     bricks: [],
     particles: [],
+    powerUps: [],
+    projectiles: [],
     screenShake: 0,
+    screenFlash: 0,
     slowMoTimer: 0,
     strobeTimer: 0,
     bricksDestroyedTotal: 0,
+    combo: 0,
+    comboTimer: 0,
     gameOver: false,
     winner: null,
+    levelYOffset: 0,
   });
 
   const initGame = useCallback((width: number, height: number) => {
-    // Center ball
-    gameState.current.ball.pos = { x: width / 2, y: height / 2 };
-    gameState.current.ball.vel = { x: Math.random() > 0.5 ? BALL_SPEED_BASE : -BALL_SPEED_BASE, y: (Math.random() - 0.5) * BALL_SPEED_BASE };
-    gameState.current.ball.active = true;
-    gameState.current.ball.speed = BALL_SPEED_BASE;
-
+    const state = gameState.current;
+    
     // Reset Paddles
-    gameState.current.p1.y = height / 2 - PADDLE_HEIGHT / 2;
-    gameState.current.p2.y = height / 2 - PADDLE_HEIGHT / 2;
-    gameState.current.p1.score = 0;
-    gameState.current.p2.score = 0;
+    state.p1.y = height - 40;
+    state.p2.y = height - 40;
+    state.p1.x = (width / 4) - (PADDLE_WIDTH / 2);
+    state.p2.x = (width * 0.75) - (PADDLE_WIDTH / 2);
+    
+    state.p1.score = 0;
+    state.p2.score = 0;
+    state.p1.ammo = 5;
+    state.p2.ammo = 5;
+    state.p1.superCharge = 0;
+    state.p2.superCharge = 0;
+    state.p1.sticky = false;
+    state.p2.sticky = false;
+
+    // Reset Balls
+    state.balls = [{
+        id: Math.random(),
+        pos: { x: width / 2, y: height / 2 },
+        vel: { x: (Math.random() - 0.5) * 4, y: -BALL_SPEED_BASE },
+        radius: BALL_RADIUS,
+        active: true,
+        speed: BALL_SPEED_BASE,
+        isSuper: false
+    }];
 
     // Generate Bricks
-    // 5 rows, center column
-    const rows = 5;
-    const cols = 8; // Actually vertical slices since it's side-to-side Pong style? 
-    // Wait, typical breakout is top-down. 
-    // The prompt says "Left paddle cyan, right one magenta". This implies side paddles (Pong). 
-    // Prompt says "Forty bricks up top". In a side-paddle game, "up top" could mean the Y-axis top, or conceptually "center field".
-    // I'll place them in the center of the screen to make it a "Battle Breaker".
-    
-    const brickW = 20;
-    const brickH = 40;
+    const rows = 8;
+    const cols = 10;
+    const brickW = width / (cols + 2); 
+    const brickH = 25;
     const startX = width / 2 - (cols * brickW) / 2;
-    const startY = height / 2 - (rows * brickH) / 2;
+    const startY = 60; 
     
     const newBricks: Brick[] = [];
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
-        // Color gradient Red to Violet (Left to Right conceptually, or Top to Bottom?)
-        // Let's do Red -> Violet across the columns
-        const hue = (c / cols) * 280; // 0 (Red) to 280 (Violet)
+        const hue = (r / rows) * 200 + (c/cols) * 60; 
         newBricks.push({
           id: r * cols + c,
-          x: startX + c * brickW * 1.5, // Spaced out horizontally
-          y: startY + r * brickH * 1.2, // Spaced out vertically
-          width: brickW,
-          height: brickH,
+          x: startX + c * brickW,
+          y: startY + r * brickH,
+          width: brickW - 4,
+          height: brickH - 4,
           active: true,
-          color: `hsl(${hue}, 80%, 60%)`
+          color: `hsl(${hue}, 80%, 50%)`,
+          health: 1
         });
       }
     }
-    gameState.current.bricks = newBricks;
-    gameState.current.bricksDestroyedTotal = 0;
-    gameState.current.gameOver = false;
-    gameState.current.winner = null;
-    gameState.current.slowMoTimer = 0;
-    gameState.current.strobeTimer = 0;
+    state.bricks = newBricks;
+    state.bricksDestroyedTotal = 0;
+    state.combo = 0;
+    state.comboTimer = 0;
+    state.gameOver = false;
+    state.winner = null;
+    state.slowMoTimer = 0;
+    state.strobeTimer = 0;
+    state.levelYOffset = 0;
+    state.powerUps = [];
+    state.projectiles = [];
     setWinner(null);
   }, []);
 
-  const resetBall = (width: number, height: number, scorer?: 'p1' | 'p2') => {
-    gameState.current.ball.pos = { x: width / 2, y: height / 2 };
-    // Serve to the loser
-    const dir = scorer === 'p1' ? -1 : 1; 
-    gameState.current.ball.vel = { 
-        x: dir * BALL_SPEED_BASE, 
-        y: (Math.random() - 0.5) * BALL_SPEED_BASE 
-    };
-    gameState.current.ball.speed = BALL_SPEED_BASE;
+  const spawnPowerUp = (x: number, y: number) => {
+    const rand = Math.random();
+    if (rand > 0.35) return; 
+
+    const types: ('ROCKET' | 'WIDE' | 'SUPER' | 'MULTIBALL' | 'STICKY')[] = ['ROCKET', 'WIDE', 'SUPER', 'MULTIBALL', 'STICKY'];
+    // Weighted random
+    const r = Math.random();
+    let type = types[0];
+    if (r < 0.3) type = 'ROCKET';
+    else if (r < 0.5) type = 'MULTIBALL';
+    else if (r < 0.7) type = 'STICKY';
+    else if (r < 0.9) type = 'WIDE';
+    else type = 'SUPER';
+
+    gameState.current.powerUps.push({
+      id: Math.random(),
+      pos: { x, y },
+      vel: { x: 0, y: 3 }, 
+      type,
+      active: true
+    });
   };
 
-  const createExplosion = (x: number, y: number, color: string) => {
-    for (let i = 0; i < PARTICLES_PER_EXPLOSION; i++) {
+  const firePaddle = (paddle: Paddle, owner: 'p1' | 'p2', width: number, height: number) => {
+    const state = gameState.current;
+    
+    // 1. Release Stuck Balls
+    let released = false;
+    state.balls.forEach(b => {
+        if (b.caughtBy === owner) {
+            b.caughtBy = undefined;
+            b.vel.y = -Math.abs(b.speed);
+            b.vel.x = (Math.random() - 0.5) * 4;
+            released = true;
+            if(!isMuted) soundManager.playPaddleHit();
+        }
+    });
+    
+    // If we released a ball, don't fire rockets this frame to avoid accidental waste
+    if (released) return;
+
+    // 2. Super Move Trigger
+    if (paddle.superCharge >= 100) {
+        triggerSuperMove(paddle, owner, width, height);
+        return;
+    }
+
+    // 3. Fire Rockets
+    if (paddle.ammo <= 0) return;
+    
+    const now = Date.now();
+    if (now - lastFireTime.current[owner] < 200) return; 
+    lastFireTime.current[owner] = now;
+
+    paddle.ammo--;
+    if (!isMuted) soundManager.playRocketFire();
+
+    state.projectiles.push({
+      id: Math.random(),
+      pos: { x: paddle.x + 5, y: paddle.y },
+      vel: { x: 0, y: -12 },
+      width: 4, height: 12,
+      color: paddle.color,
+      type: 'ROCKET',
+      active: true
+    });
+    state.projectiles.push({
+      id: Math.random(),
+      pos: { x: paddle.x + paddle.width - 5, y: paddle.y },
+      vel: { x: 0, y: -12 },
+      width: 4, height: 12,
+      color: paddle.color,
+      type: 'ROCKET',
+      active: true
+    });
+  };
+
+  const triggerSuperMove = (paddle: Paddle, owner: 'p1' | 'p2', width: number, height: number) => {
+    const state = gameState.current;
+    paddle.superCharge = 0;
+    state.screenFlash = 10;
+    state.screenShake = 20;
+    if (!isMuted) soundManager.playPowerUp(); // Use powerup sound for now, maybe deeper
+
+    if (owner === 'p1') {
+        // SUPER WAVE: Massive horizontal projectile
+        state.projectiles.push({
+            id: Math.random(),
+            pos: { x: 0, y: paddle.y - 50 },
+            vel: { x: 0, y: -20 },
+            width: width,
+            height: 40,
+            color: '#06b6d4', // Cyan
+            type: 'WAVE',
+            active: true
+        });
+    } else {
+        // SUPER CLUSTER: Spawns a "Juggernaut" ball (Mega Ball)
+        // Or just spawns 5 super balls
+        for (let i = 0; i < 5; i++) {
+             state.balls.push({
+                id: Math.random(),
+                pos: { x: paddle.x + paddle.width/2, y: paddle.y - 20 },
+                vel: { x: (Math.random() - 0.5) * 15, y: -10 - Math.random() * 5 },
+                radius: BALL_RADIUS * 1.5,
+                active: true,
+                speed: 12,
+                isSuper: true
+            });
+        }
+    }
+  };
+
+  const createExplosion = (x: number, y: number, color: string, count = 15) => {
+    for (let i = 0; i < count; i++) {
       const angle = Math.random() * Math.PI * 2;
-      const speed = Math.random() * 5 + 2;
+      const speed = Math.random() * 6 + 2;
+      const size = Math.random() * 4 + 2;
       gameState.current.particles.push({
         id: Math.random(),
         pos: { x, y },
@@ -111,7 +245,9 @@ const RetroBreaker: React.FC = () => {
         color: color,
         life: 1.0,
         maxLife: 1.0,
-        size: Math.random() * 4 + 2
+        size: size,
+        rotation: Math.random() * 360,
+        rotSpeed: (Math.random() - 0.5) * 10
       });
     }
   };
@@ -119,237 +255,470 @@ const RetroBreaker: React.FC = () => {
   const update = (width: number, height: number) => {
     const state = gameState.current;
     
-    // Slow Mo Logic
+    // Slow Mo
     let dt = 1;
     if (state.slowMoTimer > 0) {
       dt = SLOW_MO_FACTOR;
-      state.slowMoTimer -= 16; // approx 16ms per frame
+      state.slowMoTimer -= 16;
     }
-    if (state.strobeTimer > 0) {
-        state.strobeTimer -= 16;
+    if (state.strobeTimer > 0) state.strobeTimer -= 16;
+    if (state.screenFlash > 0) state.screenFlash--;
+
+    // Level Scroll
+    state.levelYOffset += GRAVITY_BRICKS * dt;
+
+    // Input
+    const gamepads = navigator.getGamepads();
+    let p1InputX = 0;
+    let p2InputX = 0;
+    let p1Fire = false;
+    let p2Fire = false;
+
+    if (gamepads[0]) {
+        p1InputX = gamepads[0].axes[0]; 
+        if (gamepads[0].buttons[0].pressed || gamepads[0].buttons[7].pressed) p1Fire = true;
+        setGamepadsActive(true);
     }
-
-    // Screen Shake decay
-    if (state.screenShake > 0) {
-      state.screenShake *= 0.9;
-      if (state.screenShake < 0.5) state.screenShake = 0;
-    }
-
-    // Input P1 (W/S)
-    if (keys.current['w'] || keys.current['W']) state.p1.y -= 10 * dt;
-    if (keys.current['s'] || keys.current['S']) state.p1.y += 10 * dt;
-    
-    // Input P2 (Arrow Up/Down)
-    if (keys.current['ArrowUp']) state.p2.y -= 10 * dt;
-    if (keys.current['ArrowDown']) state.p2.y += 10 * dt;
-
-    // Clamp Paddles
-    state.p1.y = Math.max(0, Math.min(height - state.p1.height, state.p1.y));
-    state.p2.y = Math.max(0, Math.min(height - state.p2.height, state.p2.y));
-
-    // Move Ball
-    const b = state.ball;
-    b.pos.x += b.vel.x * dt;
-    b.pos.y += b.vel.y * dt;
-
-    // Wall Collisions (Top/Bottom)
-    if (b.pos.y - b.radius < 0) {
-        b.pos.y = b.radius;
-        b.vel.y *= -1;
-        if(!isMuted) soundManager.playWallHit();
-    }
-    if (b.pos.y + b.radius > height) {
-        b.pos.y = height - b.radius;
-        b.vel.y *= -1;
-        if(!isMuted) soundManager.playWallHit();
+    if (gamepads[1]) {
+        p2InputX = gamepads[1].axes[0];
+        if (gamepads[1].buttons[0].pressed || gamepads[1].buttons[7].pressed) p2Fire = true;
     }
 
-    // Paddle Collisions
-    // P1 (Left)
-    if (
-        b.pos.x - b.radius < PADDLE_WIDTH &&
-        b.pos.y > state.p1.y &&
-        b.pos.y < state.p1.y + state.p1.height
-    ) {
-        b.vel.x = Math.abs(b.vel.x) * 1.05; // Speed up slightly
-        b.pos.x = PADDLE_WIDTH + b.radius;
-        // Add some "english" based on where it hit the paddle
-        const hitOffset = (b.pos.y - (state.p1.y + state.p1.height / 2)) / (state.p1.height / 2);
-        b.vel.y += hitOffset * 4;
-        if(!isMuted) soundManager.playPaddleHit();
+    if (keys.current['a'] || keys.current['A']) p1InputX = -1;
+    if (keys.current['d'] || keys.current['D']) p1InputX = 1;
+    if (keys.current['w'] || keys.current['W']) p1Fire = true;
+
+    if (keys.current['ArrowLeft']) p2InputX = -1;
+    if (keys.current['ArrowRight']) p2InputX = 1;
+    if (keys.current['ArrowUp']) p2Fire = true;
+
+    // Movement
+    const speed = 12 * dt;
+    state.p1.x += p1InputX * speed;
+    state.p2.x += p2InputX * speed;
+
+    state.p1.x = Math.max(0, Math.min((width / 2) - state.p1.width, state.p1.x));
+    state.p2.x = Math.max(width / 2, Math.min(width - state.p2.width, state.p2.x));
+
+    if (p1Fire) firePaddle(state.p1, 'p1', width, height);
+    if (p2Fire) firePaddle(state.p2, 'p2', width, height);
+
+    // Timers
+    [state.p1, state.p2].forEach(p => {
+        if (p.widthTimer > 0) {
+            p.widthTimer -= 16;
+            if (p.widthTimer <= 0) p.width = PADDLE_WIDTH;
+        }
+        if (p.stickyTimer > 0) {
+            p.stickyTimer -= 16;
+            if (p.stickyTimer <= 0) p.sticky = false;
+        }
+    });
+
+    // Combo Timer
+    if (state.comboTimer > 0) {
+        state.comboTimer -= 16 * dt;
+        if (state.comboTimer <= 0) state.combo = 0;
     }
 
-    // P2 (Right)
-    if (
-        b.pos.x + b.radius > width - PADDLE_WIDTH &&
-        b.pos.y > state.p2.y &&
-        b.pos.y < state.p2.y + state.p2.height
-    ) {
-        b.vel.x = -Math.abs(b.vel.x) * 1.05;
-        b.pos.x = width - PADDLE_WIDTH - b.radius;
-        const hitOffset = (b.pos.y - (state.p2.y + state.p2.height / 2)) / (state.p2.height / 2);
-        b.vel.y += hitOffset * 4;
-        if(!isMuted) soundManager.playPaddleHit();
-    }
+    // Balls Update
+    for (let i = state.balls.length - 1; i >= 0; i--) {
+        const b = state.balls[i];
+        if (!b.active) continue;
 
-    // Goal Check
-    if (b.pos.x < 0) {
-        state.p2.score += 100; // P2 scores if P1 misses
-        if(!isMuted) soundManager.playScore();
-        state.screenShake = 10;
-        resetBall(width, height, 'p2');
-    }
-    if (b.pos.x > width) {
-        state.p1.score += 100; // P1 scores if P2 misses
-        if(!isMuted) soundManager.playScore();
-        state.screenShake = 10;
-        resetBall(width, height, 'p1');
-    }
+        if (b.caughtBy) {
+            const p = b.caughtBy === 'p1' ? state.p1 : state.p2;
+            b.pos.x = p.x + (b.caughtOffset || 0);
+            b.pos.y = p.y - b.radius - 1;
+            continue;
+        }
 
-    // Brick Collisions
-    let hitBrick = false;
-    for (let i = 0; i < state.bricks.length; i++) {
-        const brick = state.bricks[i];
-        if (!brick.active) continue;
+        b.pos.x += b.vel.x * dt;
+        b.pos.y += b.vel.y * dt;
 
-        if (
-            b.pos.x + b.radius > brick.x &&
-            b.pos.x - b.radius < brick.x + brick.width &&
-            b.pos.y + b.radius > brick.y &&
-            b.pos.y - b.radius < brick.y + brick.height
-        ) {
-            brick.active = false;
-            hitBrick = true;
-            state.screenShake = 5;
-            createExplosion(brick.x + brick.width / 2, brick.y + brick.height / 2, brick.color);
-            if(!isMuted) soundManager.playBrickDestroy();
+        // Walls
+        if (b.pos.x - b.radius < 0) {
+            b.pos.x = b.radius;
+            b.vel.x *= -1;
+            if(!isMuted) soundManager.playWallHit();
+        }
+        if (b.pos.x + b.radius > width) {
+            b.pos.x = width - b.radius;
+            b.vel.x *= -1;
+            if(!isMuted) soundManager.playWallHit();
+        }
+        if (b.pos.y - b.radius < 0) {
+            b.pos.y = b.radius;
+            b.vel.y *= -1;
+            if(!isMuted) soundManager.playWallHit();
+        }
 
-            // Reverse ball velocity based on simple AABB approximation
-            // Did we hit horizontal or vertical side?
-            // Simple approach: reverse X if we are within Y bounds deeply, else reverse Y
-            // But for this speed, just reversing X is often safer if bricks are vertical columns?
-            // Let's do simple center check
-            const overlapX = (brick.width/2 + b.radius) - Math.abs(b.pos.x - (brick.x + brick.width/2));
-            const overlapY = (brick.height/2 + b.radius) - Math.abs(b.pos.y - (brick.y + brick.height/2));
-
-            if (overlapX < overlapY) {
-                b.vel.x *= -1;
-            } else {
-                b.vel.y *= -1;
+        // Floor
+        if (b.pos.y > height + 50) {
+            // Remove ball
+            state.balls.splice(i, 1);
+            state.combo = 0; // Reset combo on miss
+            if (state.balls.length === 0) {
+                // Respawn penalty
+                state.balls.push({
+                    id: Math.random(),
+                    pos: { x: width/2, y: height/2 },
+                    vel: { x: 0, y: -BALL_SPEED_BASE },
+                    radius: BALL_RADIUS,
+                    active: true,
+                    speed: BALL_SPEED_BASE,
+                    isSuper: false
+                });
+                state.screenShake = 15;
+                state.p1.score = Math.max(0, state.p1.score - 200);
+                state.p2.score = Math.max(0, state.p2.score - 200);
             }
+            continue;
+        }
 
-            state.bricksDestroyedTotal++;
-            
-            // Special: Every 10 bricks
-            if (state.bricksDestroyedTotal % 10 === 0) {
-                state.slowMoTimer = 3000; // 3 seconds
-                state.strobeTimer = 500; // 0.5s strobe
-                if(!isMuted) soundManager.playSlowMoEnter();
+        // Paddle Collision
+        [state.p1, state.p2].forEach(p => {
+             if (
+                b.pos.y + b.radius >= p.y &&
+                b.pos.y - b.radius <= p.y + p.height &&
+                b.pos.x + b.radius >= p.x &&
+                b.pos.x - b.radius <= p.x + p.width
+            ) {
+                if (b.vel.y > 0) { 
+                    if (p.sticky) {
+                        b.caughtBy = p.side === 'left' ? 'p1' : 'p2';
+                        b.caughtOffset = b.pos.x - p.x;
+                        b.vel.x = 0;
+                        b.vel.y = 0;
+                    } else {
+                        b.vel.y = -Math.abs(b.vel.y);
+                        const center = p.x + p.width / 2;
+                        const hit = (b.pos.x - center) / (p.width / 2);
+                        b.vel.x = hit * 10; 
+                        if(!isMuted) soundManager.playPaddleHit();
+                        // Charge Super
+                        p.superCharge = Math.min(100, p.superCharge + 5);
+                    }
+                }
             }
+        });
 
-            // Points? Whoever last hit the ball?
-            // For now, points are just for survival. 
-            // Let's say breaking a brick gives both players +10? Or just score for the game?
-            // Let's give points to the player moving TOWARDS the brick? 
-            // Simplified: +50 global score? No, it's competitive.
-            // Let's give points to the player whose side the ball is NOT on? 
-            if (b.vel.x > 0) state.p1.score += 50; // P1 hit it towards P2 side
-            else state.p2.score += 50; // P2 hit it towards P1 side
-            
-            break; // Only hit one brick per frame to prevent sticking
+        // Brick Collision
+        for (const brick of state.bricks) {
+            if (!brick.active) continue;
+            const by = brick.y + state.levelYOffset;
+
+            if (
+                b.pos.x + b.radius > brick.x &&
+                b.pos.x - b.radius < brick.x + brick.width &&
+                b.pos.y + b.radius > by &&
+                b.pos.y - b.radius < by + brick.height
+            ) {
+                if (!b.isSuper) {
+                     const overlapX = (brick.width/2 + b.radius) - Math.abs(b.pos.x - (brick.x + brick.width/2));
+                     const overlapY = (brick.height/2 + b.radius) - Math.abs(b.pos.y - (by + brick.height/2));
+                     if (overlapX < overlapY) b.vel.x *= -1;
+                     else b.vel.y *= -1;
+                }
+                
+                destroyBrick(brick, by);
+                if (b.isSuper) {
+                    state.screenShake = 5; // More shake for super
+                }
+            }
         }
     }
 
-    // Check Win Condition (All bricks gone)
+    // Projectiles
+    for (let i = state.projectiles.length - 1; i >= 0; i--) {
+        const proj = state.projectiles[i];
+        proj.pos.y += proj.vel.y * dt;
+        
+        if (proj.pos.y < -50) {
+            state.projectiles.splice(i, 1);
+            continue;
+        }
+
+        // Brick hit
+        for (const brick of state.bricks) {
+            if (!brick.active) continue;
+            const by = brick.y + state.levelYOffset;
+            if (
+                proj.pos.x + proj.width > brick.x &&
+                proj.pos.x < brick.x + brick.width &&
+                proj.pos.y + proj.height > by &&
+                proj.pos.y < by + brick.height
+            ) {
+                destroyBrick(brick, by);
+                if (proj.type === 'ROCKET') {
+                    state.projectiles.splice(i, 1);
+                    break; 
+                }
+                // WAVE pierces everything
+            }
+        }
+    }
+
+    // PowerUps
+    for (let i = state.powerUps.length - 1; i >= 0; i--) {
+        const pu = state.powerUps[i];
+        pu.pos.y += 3 * dt;
+        
+        let caught = false;
+        [state.p1, state.p2].forEach(p => {
+            if (
+                pu.pos.y + 10 > p.y &&
+                pu.pos.y - 10 < p.y + p.height &&
+                pu.pos.x > p.x &&
+                pu.pos.x < p.x + p.width
+            ) {
+                caught = true;
+                if(!isMuted) soundManager.playPowerUp();
+                
+                if (pu.type === 'ROCKET') p.ammo += 10;
+                if (pu.type === 'WIDE') {
+                    p.width = PADDLE_WIDTH * 1.5;
+                    p.widthTimer = 10000;
+                }
+                if (pu.type === 'SUPER') p.superCharge = 100;
+                if (pu.type === 'STICKY') {
+                    p.sticky = true;
+                    p.stickyTimer = 15000;
+                }
+                if (pu.type === 'MULTIBALL') {
+                    // Spawn 2 balls at paddle
+                    for(let k=0; k<2; k++) {
+                        state.balls.push({
+                            id: Math.random(),
+                            pos: { x: p.x + p.width/2, y: p.y - 20 },
+                            vel: { x: (Math.random()-0.5)*10, y: -8 },
+                            radius: BALL_RADIUS,
+                            active: true,
+                            speed: 8,
+                            isSuper: false
+                        });
+                    }
+                }
+            }
+        });
+
+        if (caught || pu.pos.y > height) state.powerUps.splice(i, 1);
+    }
+
+    // Lose Condition
+    // Check if bricks reached bottom
+    for (const brick of state.bricks) {
+        if (brick.active && brick.y + state.levelYOffset + brick.height > height - 60) {
+            state.gameOver = true;
+            setWinner("THE BRICKS");
+            setIsPlaying(false);
+            break;
+        }
+    }
+
+    // Win Condition
     if (!state.bricks.some(b => b.active) && !state.gameOver) {
         state.gameOver = true;
-        if (state.p1.score > state.p2.score) setWinner("PLAYER 1");
-        else if (state.p2.score > state.p1.score) setWinner("PLAYER 2");
-        else setWinner("DRAW");
+        setWinner("PLAYERS");
         setIsPlaying(false);
     }
 
-    // Update Particles
+    // Shake Decay
+    if (state.screenShake > 0) {
+        state.screenShake *= 0.9;
+        if (state.screenShake < 0.5) state.screenShake = 0;
+    }
+
+    // Particles
     for (let i = state.particles.length - 1; i >= 0; i--) {
         const p = state.particles[i];
         p.pos.x += p.vel.x * dt;
         p.pos.y += p.vel.y * dt;
+        p.rotation += p.rotSpeed * dt;
         p.life -= 0.02 * dt;
-        if (p.life <= 0) {
-            state.particles.splice(i, 1);
-        }
+        if (p.life <= 0) state.particles.splice(i, 1);
     }
+  };
+
+  const destroyBrick = (brick: Brick, yPos: number) => {
+      const state = gameState.current;
+      brick.active = false;
+      state.screenShake = 3;
+      state.screenFlash = 2;
+      createExplosion(brick.x + brick.width / 2, yPos + brick.height / 2, brick.color, 20); // More particles
+      spawnPowerUp(brick.x + brick.width/2, yPos + brick.height/2);
+      if(!isMuted) soundManager.playBrickDestroy();
+      state.bricksDestroyedTotal++;
+      
+      // Combo logic
+      state.combo++;
+      state.comboTimer = COMBO_TIMEOUT;
+      const multiplier = 1 + Math.floor(state.combo / 5);
+
+      state.p1.score += 50 * multiplier;
+      state.p2.score += 50 * multiplier;
+  };
+
+  const drawMetalRect = (ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, color: string) => {
+    // Advanced metallic look with shimmer
+    const time = Date.now() / 1000;
+    
+    const grad = ctx.createLinearGradient(x, y, x, y + h);
+    grad.addColorStop(0, '#e4e4e7'); 
+    grad.addColorStop(0.3, color); 
+    grad.addColorStop(0.5, '#ffffff'); // Highlight
+    grad.addColorStop(0.7, color);
+    grad.addColorStop(1, '#71717a'); 
+
+    ctx.fillStyle = grad;
+    ctx.fillRect(x, y, w, h);
+
+    // Diagonal Shimmer
+    const shimmerPos = (Date.now() / 15) % (w * 3) - w;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x, y, w, h);
+    ctx.clip();
+    
+    const shimmerGrad = ctx.createLinearGradient(x + shimmerPos, y, x + shimmerPos + 50, y + h);
+    shimmerGrad.addColorStop(0, 'rgba(255,255,255,0)');
+    shimmerGrad.addColorStop(0.5, 'rgba(255,255,255,0.6)');
+    shimmerGrad.addColorStop(1, 'rgba(255,255,255,0)');
+    
+    ctx.fillStyle = shimmerGrad;
+    ctx.fillRect(x, y, w, h);
+    ctx.restore();
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.8)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x,y,w,h);
   };
 
   const draw = (ctx: CanvasRenderingContext2D, width: number, height: number) => {
     const state = gameState.current;
 
-    // Clear with trail effect or solid
-    // Strobe effect
+    // BG
+    ctx.fillStyle = '#09090b'; 
+    ctx.fillRect(0, 0, width, height);
+
     if (state.strobeTimer > 0 && Math.floor(Date.now() / 50) % 2 === 0) {
         ctx.fillStyle = 'rgba(255, 255, 255, 0.1)';
         ctx.fillRect(0, 0, width, height);
     }
+    
+    if (state.screenFlash > 0) {
+        ctx.fillStyle = `rgba(255, 255, 255, ${state.screenFlash * 0.1})`;
+        ctx.fillRect(0, 0, width, height);
+    }
 
-    ctx.fillStyle = '#09090b'; // Background
-    ctx.fillRect(0, 0, width, height);
-
-    // Apply Shake
     ctx.save();
     if (state.screenShake > 0) {
-        const dx = (Math.random() - 0.5) * state.screenShake * 2;
-        const dy = (Math.random() - 0.5) * state.screenShake * 2;
+        const dx = (Math.random() - 0.5) * state.screenShake;
+        const dy = (Math.random() - 0.5) * state.screenShake;
         ctx.translate(dx, dy);
     }
 
-    // Glow effect
-    ctx.shadowBlur = 15;
-    ctx.lineCap = 'round';
-
-    // Draw Bricks
+    // Bricks
     state.bricks.forEach(b => {
         if (!b.active) return;
-        ctx.shadowColor = b.color;
-        ctx.strokeStyle = b.color;
-        ctx.lineWidth = 2;
-        ctx.strokeRect(b.x, b.y, b.width, b.height);
+        const by = b.y + state.levelYOffset;
         
-        ctx.fillStyle = b.color;
-        ctx.globalAlpha = 0.3;
-        ctx.fillRect(b.x, b.y, b.width, b.height);
-        ctx.globalAlpha = 1.0;
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = b.color;
+        
+        const grad = ctx.createLinearGradient(b.x, by, b.x + b.width, by + b.height);
+        grad.addColorStop(0, b.color);
+        grad.addColorStop(0.5, '#fff'); // Metallic ridge
+        grad.addColorStop(1, b.color);
+        
+        ctx.fillStyle = grad;
+        ctx.fillRect(b.x, by, b.width, b.height);
     });
 
-    // Draw Paddles
-    // P1
+    // Paddles
+    ctx.shadowBlur = 15;
     ctx.shadowColor = state.p1.color;
-    ctx.fillStyle = state.p1.color;
-    ctx.fillRect(0, state.p1.y, state.p1.width, state.p1.height);
-    
-    // P2
+    drawMetalRect(ctx, state.p1.x, state.p1.y, state.p1.width, state.p1.height, state.p1.color);
+    if (state.p1.sticky) {
+        ctx.fillStyle = 'rgba(255,255,255,0.5)';
+        ctx.fillRect(state.p1.x, state.p1.y, state.p1.width, 4); // Sticky glue visual
+    }
+
     ctx.shadowColor = state.p2.color;
-    ctx.fillStyle = state.p2.color;
-    ctx.fillRect(width - state.p2.width, state.p2.y, state.p2.width, state.p2.height);
+    drawMetalRect(ctx, state.p2.x, state.p2.y, state.p2.width, state.p2.height, state.p2.color);
+    if (state.p2.sticky) {
+        ctx.fillStyle = 'rgba(255,255,255,0.5)';
+        ctx.fillRect(state.p2.x, state.p2.y, state.p2.width, 4);
+    }
 
-    // Draw Ball
-    ctx.shadowColor = '#ffffff';
-    ctx.fillStyle = '#ffffff';
-    ctx.beginPath();
-    ctx.arc(state.ball.pos.x, state.ball.pos.y, state.ball.radius, 0, Math.PI * 2);
-    ctx.fill();
+    // Balls
+    state.balls.forEach(b => {
+        ctx.shadowBlur = b.isSuper ? 30 : 15;
+        ctx.shadowColor = b.isSuper ? '#ef4444' : '#ffffff';
+        ctx.fillStyle = b.isSuper ? '#ef4444' : '#ffffff';
+        ctx.beginPath();
+        ctx.arc(b.pos.x, b.pos.y, b.radius, 0, Math.PI * 2);
+        ctx.fill();
+    });
 
-    // Draw Particles
+    // Projectiles
+    state.projectiles.forEach(p => {
+        ctx.shadowColor = p.color;
+        ctx.shadowBlur = 10;
+        ctx.fillStyle = p.type === 'WAVE' ? '#22d3ee' : '#fff';
+        ctx.fillRect(p.pos.x, p.pos.y, p.width, p.height);
+    });
+
+    // Powerups
+    state.powerUps.forEach(p => {
+        ctx.shadowColor = '#fbbf24';
+        ctx.shadowBlur = 10;
+        ctx.fillStyle = '#fbbf24';
+        ctx.beginPath();
+        if (p.type === 'ROCKET') {
+            ctx.moveTo(p.pos.x, p.pos.y - 10);
+            ctx.lineTo(p.pos.x + 8, p.pos.y + 10);
+            ctx.lineTo(p.pos.x - 8, p.pos.y + 10);
+        } else if (p.type === 'MULTIBALL') {
+             ctx.arc(p.pos.x - 5, p.pos.y, 4, 0, Math.PI * 2);
+             ctx.arc(p.pos.x + 5, p.pos.y, 4, 0, Math.PI * 2);
+        } else if (p.type === 'STICKY') {
+            ctx.rect(p.pos.x - 8, p.pos.y - 8, 16, 16);
+        } else if (p.type === 'WIDE') {
+            ctx.rect(p.pos.x - 12, p.pos.y - 4, 24, 8);
+        } else {
+            ctx.arc(p.pos.x, p.pos.y, 8, 0, Math.PI * 2);
+        }
+        ctx.fill();
+    });
+
+    // Particles
     state.particles.forEach(p => {
+        ctx.save();
+        ctx.translate(p.pos.x, p.pos.y);
+        ctx.rotate(p.rotation * Math.PI / 180);
         ctx.shadowColor = p.color;
         ctx.fillStyle = p.color;
         ctx.globalAlpha = p.life;
+        // Shard shape
         ctx.beginPath();
-        ctx.arc(p.pos.x, p.pos.y, p.size, 0, Math.PI * 2);
+        ctx.moveTo(0, -p.size);
+        ctx.lineTo(p.size, p.size);
+        ctx.lineTo(-p.size, p.size);
         ctx.fill();
-        ctx.globalAlpha = 1.0;
+        ctx.restore();
     });
 
     ctx.restore();
+    
+    // UI Divider
+    ctx.strokeStyle = '#3f3f46';
+    ctx.beginPath();
+    ctx.setLineDash([10, 10]);
+    ctx.moveTo(width / 2, height - 100);
+    ctx.lineTo(width / 2, height);
+    ctx.stroke();
+    ctx.setLineDash([]);
   };
 
   const loop = useCallback((time: number) => {
@@ -376,29 +745,26 @@ const RetroBreaker: React.FC = () => {
   }, [isPlaying, loop]);
 
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      keys.current[e.key] = true;
-    };
-    const handleKeyUp = (e: KeyboardEvent) => {
-      keys.current[e.key] = false;
-    };
+    const handleKeyDown = (e: KeyboardEvent) => { keys.current[e.key] = true; };
+    const handleKeyUp = (e: KeyboardEvent) => { keys.current[e.key] = false; };
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
+    const handleGamepad = () => setGamepadsActive(true);
+    window.addEventListener('gamepadconnected', handleGamepad);
+    
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('gamepadconnected', handleGamepad);
     };
   }, []);
 
-  // Initialization Effect
   useEffect(() => {
     if (containerRef.current && canvasRef.current) {
         const { clientWidth, clientHeight } = containerRef.current;
         canvasRef.current.width = clientWidth;
         canvasRef.current.height = clientHeight;
         initGame(clientWidth, clientHeight);
-        
-        // Render one frame so it's not empty
         const ctx = canvasRef.current.getContext('2d');
         if (ctx) draw(ctx, clientWidth, clientHeight);
     }
@@ -407,9 +773,6 @@ const RetroBreaker: React.FC = () => {
             const { clientWidth, clientHeight } = containerRef.current;
             canvasRef.current.width = clientWidth;
             canvasRef.current.height = clientHeight;
-            // Re-init game on resize might be annoying, but ensures positions are valid
-            // Just clamping positions is better for a real app, but simplified here:
-            initGame(clientWidth, clientHeight);
         }
     };
     window.addEventListener('resize', handleResize);
@@ -420,93 +783,150 @@ const RetroBreaker: React.FC = () => {
     <div className="relative w-full h-screen bg-zinc-950 flex flex-col items-center justify-center overflow-hidden">
       
       {/* HUD Layer */}
-      <div className="absolute top-0 left-0 w-full p-8 flex justify-between items-start pointer-events-none z-20 font-['Bangers'] tracking-wider text-4xl select-none">
-        <div className="flex flex-col items-start drop-shadow-[0_0_10px_rgba(6,182,212,0.8)]">
-          <span className="text-cyan-500">PLAYER 1</span>
-          <span className="text-white text-6xl">{gameState.current.p1.score}</span>
+      <div className="absolute top-0 left-0 w-full p-4 flex justify-between items-start pointer-events-none z-20 select-none">
+        
+        {/* P1 HUD */}
+        <div className="flex flex-col items-start">
+          <div className="flex items-center gap-2 mb-1">
+             <div className="w-2 h-8 bg-cyan-500 rounded shadow-[0_0_10px_#06b6d4]"></div>
+             <h2 className="text-3xl font-black italic tracking-tighter text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-white drop-shadow-md font-['Orbitron']">
+               CYBER-1
+             </h2>
+          </div>
+          <span className="text-white text-4xl font-mono tracking-widest pl-4">{gameState.current.p1.score.toString().padStart(6, '0')}</span>
+          <div className="mt-2 pl-4 flex flex-col gap-1 w-48">
+             <div className="flex items-center gap-2">
+                <span className="text-xs text-cyan-400 w-12">AMMO</span>
+                <div className="flex-1 h-2 bg-zinc-800 rounded overflow-hidden border border-zinc-700">
+                    <div className="h-full bg-cyan-500" style={{width: `${(gameState.current.p1.ammo / 20) * 100}%`}}></div>
+                </div>
+             </div>
+             <div className="flex items-center gap-2">
+                <span className="text-xs text-yellow-400 w-12">SUPER</span>
+                <div className="flex-1 h-2 bg-zinc-800 rounded overflow-hidden border border-zinc-700">
+                    <div className="h-full bg-yellow-400" style={{width: `${gameState.current.p1.superCharge}%`}}></div>
+                </div>
+             </div>
+             {gameState.current.p1.sticky && <span className="text-xs text-green-400 animate-pulse">MAGNET ACTIVE</span>}
+          </div>
         </div>
         
-        <div className="flex flex-col items-end drop-shadow-[0_0_10px_rgba(217,70,239,0.8)]">
-          <span className="text-fuchsia-500">PLAYER 2</span>
-          <span className="text-white text-6xl">{gameState.current.p2.score}</span>
+        {/* CENTER COMBO HUD */}
+        {gameState.current.combo > 1 && (
+             <div className="absolute top-20 left-1/2 -translate-x-1/2 flex flex-col items-center animate-bounce">
+                <span className="text-4xl font-black text-yellow-500 drop-shadow-[0_0_10px_rgba(234,179,8,0.8)] font-['Bangers']">
+                    {gameState.current.combo}x COMBO
+                </span>
+                <div className="w-32 h-2 bg-zinc-800 rounded-full mt-1 overflow-hidden">
+                    <div className="h-full bg-yellow-500 transition-all duration-75" 
+                         style={{width: `${(gameState.current.comboTimer / COMBO_TIMEOUT) * 100}%`}}></div>
+                </div>
+             </div>
+        )}
+
+        {/* P2 HUD */}
+        <div className="flex flex-col items-end">
+          <div className="flex items-center gap-2 mb-1">
+             <h2 className="text-3xl font-black italic tracking-tighter text-transparent bg-clip-text bg-gradient-to-l from-fuchsia-400 to-white drop-shadow-md font-['Orbitron']">
+               NEON-2
+             </h2>
+             <div className="w-2 h-8 bg-fuchsia-500 rounded shadow-[0_0_10px_#d946ef]"></div>
+          </div>
+          <span className="text-white text-4xl font-mono tracking-widest pr-4">{gameState.current.p2.score.toString().padStart(6, '0')}</span>
+          <div className="mt-2 pr-4 flex flex-col gap-1 w-48 items-end">
+             <div className="flex items-center gap-2 w-full">
+                <div className="flex-1 h-2 bg-zinc-800 rounded overflow-hidden border border-zinc-700">
+                    <div className="h-full bg-fuchsia-500" style={{width: `${(gameState.current.p2.ammo / 20) * 100}%`}}></div>
+                </div>
+                <span className="text-xs text-fuchsia-400 w-12 text-right">AMMO</span>
+             </div>
+             <div className="flex items-center gap-2 w-full">
+                <div className="flex-1 h-2 bg-zinc-800 rounded overflow-hidden border border-zinc-700">
+                    <div className="h-full bg-yellow-400" style={{width: `${gameState.current.p2.superCharge}%`}}></div>
+                </div>
+                <span className="text-xs text-yellow-400 w-12 text-right">SUPER</span>
+             </div>
+             {gameState.current.p2.sticky && <span className="text-xs text-green-400 animate-pulse">MAGNET ACTIVE</span>}
+          </div>
         </div>
       </div>
 
-      {/* Controls Help Overlay (Only when paused) */}
-      {!isPlaying && !winner && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center z-30 bg-black/80 backdrop-blur-sm">
-          <h1 className="text-7xl mb-8 text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-fuchsia-500 font-['Orbitron'] font-black drop-shadow-[0_0_15px_rgba(255,255,255,0.5)] text-center animate-pulse">
-            NEON RAGE<br/>BREAKER
-          </h1>
-          
-          <div className="flex gap-12 mb-12">
-            <div className="text-center">
-              <h3 className="text-cyan-400 text-2xl mb-2 font-bold">PLAYER 1</h3>
-              <div className="flex gap-2 justify-center text-zinc-400">
-                <kbd className="px-4 py-2 bg-zinc-800 rounded border border-zinc-700 font-mono text-xl">W</kbd>
-                <kbd className="px-4 py-2 bg-zinc-800 rounded border border-zinc-700 font-mono text-xl">S</kbd>
+      {!isPlaying && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center z-30 bg-black/85 backdrop-blur-md">
+           {winner ? (
+              <div className="flex flex-col items-center animate-in zoom-in duration-300">
+                 <Trophy className="w-24 h-24 text-yellow-400 mb-4 animate-bounce drop-shadow-[0_0_20px_rgba(250,204,21,0.5)]" />
+                 <h1 className="text-6xl font-black text-white mb-2 font-['Bangers'] tracking-wider">{winner} WINS</h1>
+                 <p className="text-zinc-400 mb-8 font-mono">FINAL SCORE: {(gameState.current.p1.score + gameState.current.p2.score)}</p>
+                 <button 
+                    onClick={() => {
+                        if (containerRef.current) initGame(containerRef.current.clientWidth, containerRef.current.clientHeight);
+                        setIsPlaying(true);
+                    }}
+                    className="px-8 py-3 bg-white text-black font-bold rounded hover:scale-105 transition-transform"
+                 >
+                    REMATCH
+                 </button>
               </div>
-            </div>
-            <div className="h-20 w-px bg-zinc-700"></div>
-            <div className="text-center">
-              <h3 className="text-fuchsia-400 text-2xl mb-2 font-bold">PLAYER 2</h3>
-              <div className="flex gap-2 justify-center text-zinc-400">
-                <kbd className="px-4 py-2 bg-zinc-800 rounded border border-zinc-700 font-mono text-xl">↑</kbd>
-                <kbd className="px-4 py-2 bg-zinc-800 rounded border border-zinc-700 font-mono text-xl">↓</kbd>
-              </div>
-            </div>
-          </div>
+           ) : (
+             <div className="text-center">
+                <h1 className="text-8xl mb-2 text-transparent bg-clip-text bg-gradient-to-b from-white to-zinc-500 font-['Orbitron'] font-black italic tracking-tight drop-shadow-2xl">
+                  METAL RAGE
+                </h1>
+                <p className="text-xl text-cyan-400 font-mono tracking-widest mb-12 uppercase drop-shadow-[0_0_10px_#06b6d4]">
+                    Vertical Co-Op Defense
+                </p>
 
-          <button 
-            onClick={() => {
-                setIsPlaying(true);
-                // Ensure audio context is ready
-                soundManager.playPaddleHit(); // Dummy play to unlock audio context
-            }}
-            className="group relative px-8 py-4 bg-white text-black font-black text-2xl skew-x-[-10deg] hover:scale-110 transition-transform duration-200"
-          >
-            <div className="absolute inset-0 bg-gradient-to-r from-cyan-500 to-fuchsia-500 blur opacity-75 group-hover:opacity-100 transition-opacity"></div>
-            <div className="relative flex items-center gap-2">
-              <Play fill="black" /> INSERT COIN (START)
-            </div>
-          </button>
+                <div className="grid grid-cols-2 gap-16 mb-12 text-left">
+                    <div className="space-y-4">
+                        <h3 className="text-cyan-500 font-bold border-b border-zinc-700 pb-2 flex items-center gap-2"><Zap size={20}/> CYBER-1</h3>
+                        <div className="flex items-center gap-4 text-zinc-400 font-mono text-sm">
+                            <span className="border border-zinc-700 px-2 py-1 rounded bg-zinc-900">A / D</span> MOVE
+                        </div>
+                        <div className="flex items-center gap-4 text-zinc-400 font-mono text-sm">
+                            <span className="border border-zinc-700 px-2 py-1 rounded bg-zinc-900">W</span> FIRE / SUPER
+                        </div>
+                    </div>
+                    <div className="space-y-4">
+                        <h3 className="text-fuchsia-500 font-bold border-b border-zinc-700 pb-2 flex items-center gap-2"><Target size={20}/> NEON-2</h3>
+                         <div className="flex items-center gap-4 text-zinc-400 font-mono text-sm">
+                            <span className="border border-zinc-700 px-2 py-1 rounded bg-zinc-900">← / →</span> MOVE
+                        </div>
+                        <div className="flex items-center gap-4 text-zinc-400 font-mono text-sm">
+                            <span className="border border-zinc-700 px-2 py-1 rounded bg-zinc-900">↑</span> FIRE / SUPER
+                        </div>
+                    </div>
+                </div>
+
+                <button 
+                  onClick={() => {
+                      setIsPlaying(true);
+                      soundManager.playPaddleHit(); 
+                  }}
+                  className="relative group px-12 py-6 bg-zinc-100 text-black font-black text-2xl skew-x-[-12deg] hover:bg-white hover:scale-105 transition-all"
+                >
+                  <span className="relative z-10 flex items-center gap-2">
+                    <Play fill="black" size={24}/> INITIATE
+                  </span>
+                  <div className="absolute inset-0 bg-gradient-to-r from-cyan-500 via-white to-fuchsia-500 opacity-0 group-hover:opacity-20 transition-opacity"></div>
+                </button>
+             </div>
+           )}
         </div>
       )}
 
-      {/* Winner Overlay */}
-      {winner && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center z-40 bg-black/90 backdrop-blur-md animate-in fade-in duration-500">
-          <Trophy className="w-32 h-32 text-yellow-400 mb-4 drop-shadow-[0_0_30px_rgba(250,204,21,0.6)] animate-bounce" />
-          <h2 className="text-8xl font-black text-white mb-4 font-['Bangers'] tracking-widest drop-shadow-lg">
-            {winner} WINS!
-          </h2>
-          <button 
-            onClick={() => {
-                if (containerRef.current) initGame(containerRef.current.clientWidth, containerRef.current.clientHeight);
-                setIsPlaying(true);
-            }}
-            className="mt-8 px-8 py-3 bg-zinc-800 hover:bg-zinc-700 text-white rounded-full flex items-center gap-2 transition-colors border border-zinc-600"
-          >
-            <RotateCcw className="w-5 h-5" /> PLAY AGAIN
-          </button>
-        </div>
-      )}
-
-      {/* Mute Toggle */}
       <button 
         onClick={() => setIsMuted(!isMuted)}
-        className="absolute bottom-8 right-8 z-30 p-3 bg-zinc-900/50 hover:bg-zinc-800 rounded-full text-zinc-400 hover:text-white transition-colors border border-zinc-700"
+        className="absolute bottom-6 right-6 z-30 p-2 bg-zinc-900/50 hover:bg-zinc-800 rounded-lg text-zinc-400 hover:text-white transition-colors border border-zinc-700"
       >
-        {isMuted ? <VolumeX /> : <Volume2 />}
+        {isMuted ? <VolumeX size={20} /> : <Volume2 size={20} />}
       </button>
 
-      {/* Game Canvas Container */}
       <div ref={containerRef} className="w-full h-full relative">
         <canvas ref={canvasRef} className="block w-full h-full" />
       </div>
       
-      {/* Scanline Overlay */}
-      <div className="scanlines pointer-events-none"></div>
+      <div className="scanlines pointer-events-none opacity-50"></div>
     </div>
   );
 };

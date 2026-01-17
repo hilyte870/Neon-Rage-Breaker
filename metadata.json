@@ -1,5 +1,5 @@
 {
-  "name": "Neon Rage Breaker",
-  "description": "A high-octane, two-player Pong-style brick breaker with neon aesthetics, particle effects, and screen shake.",
+  "name": "Neon Rage Breaker: Metal Edition",
+  "description": "A vertical split-screen co-op brick breaker with gamepad support, power-ups, rockets, and metallic neon aesthetics.",
   "requestFramePermissions": []
 }
