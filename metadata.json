@@ -1,0 +1,5 @@
+{
+  "name": "Neon Rage Breaker",
+  "description": "A high-octane, two-player Pong-style brick breaker with neon aesthetics, particle effects, and screen shake.",
+  "requestFramePermissions": []
+}
